@@ -22,8 +22,33 @@ jobs:
           gradle-version: '8.11.1'
       - name: Install Android SDK 35
         run: '"$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-35" "build-tools;35.0.0"'
+      - name: Restore permanent APK signing key
+        env:
+          PAVDROID_DEBUG_KEYSTORE_B64: ${{ secrets.PAVDROID_DEBUG_KEYSTORE_B64 }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "${PAVDROID_DEBUG_KEYSTORE_B64:-}" ]]; then
+            echo "::error::Missing Actions secret PAVDROID_DEBUG_KEYSTORE_B64. Refusing to build with a disposable key."
+            exit 1
+          fi
+          mkdir -p "$HOME/.android"
+          printf '%s' "$PAVDROID_DEBUG_KEYSTORE_B64" | base64 --decode > "$HOME/.android/debug.keystore"
+          chmod 600 "$HOME/.android/debug.keystore"
+          keytool -list -keystore "$HOME/.android/debug.keystore" -storepass android -alias androiddebugkey > /dev/null
+          actual="$(keytool -list -v -keystore "$HOME/.android/debug.keystore" -storepass android -alias androiddebugkey 2>/dev/null | sed -n 's/^[[:space:]]*SHA256: //p' | head -n 1)"
+          expected='37:CE:EE:56:EA:BB:B1:E1:41:76:5E:7B:CB:04:F1:01:70:AE:11:9B:7A:33:78:5A:17:43:39:B3:6C:10:50:60'
+          if [[ "$actual" != "$expected" ]]; then
+            echo "::error::Signing key fingerprint mismatch; refusing to break future APK updates."
+            exit 1
+          fi
       - name: Compile APK
         run: gradle --no-daemon :app:assembleDebug
+      - name: Verify APK signing certificate
+        shell: bash
+        run: |
+          set -euo pipefail
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --print-certs app/build/outputs/apk/debug/app-debug.apk | grep -qi '37ceee56eabbb1e141765e7bcb04f10170ae119b7a33785a174339b36c105060'
       - uses: actions/upload-artifact@v4
         with:
           name: PavDroid-V1.0.0-debug-APK

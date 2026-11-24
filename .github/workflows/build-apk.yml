@@ -13,8 +13,6 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 25
     env:
-      # This key lives only on the runner. It is not stored in project.zip.
-      PAVDROID_SIGNING_KEYSTORE: ${{ runner.temp }}/pavdroid-signing/debug.keystore
       EXPECTED_SIGNER_SHA256: 37ceee56eabbb1e141765e7bcb04f10170ae119b7a33785a174339b36c105060
 
     steps:
@@ -56,10 +54,15 @@ jobs:
             exit 1
           fi
 
+          # RUNNER_TEMP is provided as a shell environment variable by GitHub.
+          # `runner.temp` is not valid in job-level env expressions.
+          export PAVDROID_SIGNING_KEYSTORE="$RUNNER_TEMP/pavdroid-signing/debug.keystore"
           mkdir -p "$(dirname "$PAVDROID_SIGNING_KEYSTORE")"
           umask 077
           printf '%s' "$PAVDROID_DEBUG_KEYSTORE_B64" | base64 --decode > "$PAVDROID_SIGNING_KEYSTORE"
           chmod 600 "$PAVDROID_SIGNING_KEYSTORE"
+          # Make the exact same path available to subsequent Gradle build steps.
+          printf 'PAVDROID_SIGNING_KEYSTORE=%s\n' "$PAVDROID_SIGNING_KEYSTORE" >> "$GITHUB_ENV"
 
           # Certificate fingerprints are public. Never print the keystore or secret.
           actual="$({

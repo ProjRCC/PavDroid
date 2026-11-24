@@ -1,55 +1,147 @@
 name: Build PavDroid APK
+
 on:
   push:
     branches: [main, master]
   workflow_dispatch:
+
 permissions:
   contents: read
+
 jobs:
   build:
     runs-on: ubuntu-latest
     timeout-minutes: 25
+    env:
+      # This key lives only on the runner. It is not stored in project.zip.
+      PAVDROID_SIGNING_KEYSTORE: ${{ runner.temp }}/pavdroid-signing/debug.keystore
+      EXPECTED_SIGNER_SHA256: 37ceee56eabbb1e141765e7bcb04f10170ae119b7a33785a174339b36c105060
+
     steps:
       - uses: actions/checkout@v4
-      - name: Extract attached project for build
-        run: unzip -o project.zip -x '.github/workflows/*'
+
+      - name: Extract project (do not modify project.zip)
+        shell: bash
+        run: |
+          set -euo pipefail
+          unzip -o project.zip -x '.github/workflows/*'
+          test -f app/build.gradle || {
+            echo '::error::Expected app/build.gradle in project.zip (Groovy DSL).'
+            exit 1
+          }
+
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
+
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.11.1'
+
       - name: Install Android SDK 35
-        run: '"$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-35" "build-tools;35.0.0"'
-      - name: Restore permanent APK signing key
+        shell: bash
+        run: |
+          set -euo pipefail
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-35" "build-tools;35.0.0"
+
+      - name: Restore and validate permanent signing key
+        shell: bash
         env:
           PAVDROID_DEBUG_KEYSTORE_B64: ${{ secrets.PAVDROID_DEBUG_KEYSTORE_B64 }}
-        shell: bash
         run: |
           set -euo pipefail
           if [[ -z "${PAVDROID_DEBUG_KEYSTORE_B64:-}" ]]; then
-            echo "::error::Missing Actions secret PAVDROID_DEBUG_KEYSTORE_B64. Refusing to build with a disposable key."
+            echo '::error::Missing PAVDROID_DEBUG_KEYSTORE_B64 GitHub Actions secret; refusing temporary signing.'
             exit 1
           fi
-          mkdir -p "$HOME/.android"
-          printf '%s' "$PAVDROID_DEBUG_KEYSTORE_B64" | base64 --decode > "$HOME/.android/debug.keystore"
-          chmod 600 "$HOME/.android/debug.keystore"
-          keytool -list -keystore "$HOME/.android/debug.keystore" -storepass android -alias androiddebugkey > /dev/null
-          actual="$(keytool -list -v -keystore "$HOME/.android/debug.keystore" -storepass android -alias androiddebugkey 2>/dev/null | sed -n 's/^[[:space:]]*SHA256: //p' | head -n 1)"
-          expected='37:CE:EE:56:EA:BB:B1:E1:41:76:5E:7B:CB:04:F1:01:70:AE:11:9B:7A:33:78:5A:17:43:39:B3:6C:10:50:60'
-          if [[ "$actual" != "$expected" ]]; then
-            echo "::error::Signing key fingerprint mismatch; refusing to break future APK updates."
+
+          mkdir -p "$(dirname "$PAVDROID_SIGNING_KEYSTORE")"
+          umask 077
+          printf '%s' "$PAVDROID_DEBUG_KEYSTORE_B64" | base64 --decode > "$PAVDROID_SIGNING_KEYSTORE"
+          chmod 600 "$PAVDROID_SIGNING_KEYSTORE"
+
+          # Certificate fingerprints are public. Never print the keystore or secret.
+          actual="$({
+            keytool -list -v -keystore "$PAVDROID_SIGNING_KEYSTORE" \
+              -storepass android -alias androiddebugkey 2>/dev/null
+          } | sed -nE 's/^[[:space:]]*SHA256:[[:space:]]*([[:xdigit:]:]+).*$/\1/p' \
+            | tr -d ':' | tr 'A-F' 'a-f')"
+          echo "Restored keystore certificate SHA-256: ${actual:-NOT_FOUND}"
+          if [[ "$actual" != "$EXPECTED_SIGNER_SHA256" ]]; then
+            echo '::error::Permanent keystore certificate does not match the pinned fingerprint.'
             exit 1
           fi
-      - name: Compile APK
-        run: gradle --no-daemon :app:assembleDebug
-      - name: Verify APK signing certificate
+
+      - name: Explicitly configure Gradle to use the permanent key
         shell: bash
         run: |
           set -euo pipefail
-          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --print-certs app/build/outputs/apk/debug/app-debug.apk | grep -qi '37ceee56eabbb1e141765e7bcb04f10170ae119b7a33785a174339b36c105060'
-      - uses: actions/upload-artifact@v4
+          # Only the extracted, temporary build.gradle is modified. project.zip stays untouched.
+          # V2.0.8 uses app/build.gradle (Groovy DSL) and :app:assembleDebug.
+          cat >> app/build.gradle <<'GROOVY'
+
+          // CI-only permanent debug signing. This block is added AFTER extraction;
+          // it is intentionally absent from the source project.zip.
+          def pavdroidSigningFilePath = System.getenv('PAVDROID_SIGNING_KEYSTORE')
+          if (!pavdroidSigningFilePath || !file(pavdroidSigningFilePath).isFile()) {
+              throw new GradleException('Permanent PavDroid signing key missing; refusing debug build')
+          }
+          android {
+              signingConfigs {
+                  debug {
+                      storeFile file(pavdroidSigningFilePath)
+                      storeType = 'jks'
+                      storePassword 'android'
+                      keyAlias 'androiddebugkey'
+                      keyPassword 'android'
+                  }
+              }
+              buildTypes {
+                  debug {
+                      signingConfig signingConfigs.debug
+                  }
+              }
+          }
+          GROOVY
+
+      - name: Compile APK with permanent signing key
+        shell: bash
+        run: |
+          set -euo pipefail
+          gradle --no-daemon :app:assembleDebug
+
+      - name: Verify and log actual APK signer
+        shell: bash
+        run: |
+          set -euo pipefail
+          apk='app/build/outputs/apk/debug/app-debug.apk'
+          test -s "$apk" || {
+            echo "::error::APK is missing: $apk"
+            exit 1
+          }
+          apksigner="$ANDROID_HOME/build-tools/35.0.0/apksigner"
+          if ! report=$("$apksigner" verify --print-certs "$apk" 2>&1); then
+            printf '%s\n' "$report"
+            echo '::error::APK signature verification failed.'
+            exit 1
+          fi
+          # Prints public certificate information, not signing key material.
+          printf '%s\n' "$report"
+          signer_sha256="$(printf '%s\n' "$report" \
+            | sed -nE 's/^Signer #1 certificate SHA-256 digest:[[:space:]]*([[:xdigit:]:]+).*$/\1/p' \
+            | tr -d ':' | tr 'A-F' 'a-f')"
+          echo "Actual APK signer SHA-256: ${signer_sha256:-NOT_FOUND}"
+          echo "Required APK signer SHA-256: $EXPECTED_SIGNER_SHA256"
+          if [[ "$signer_sha256" != "$EXPECTED_SIGNER_SHA256" ]]; then
+            echo '::error::APK was not signed by the pinned permanent certificate; refusing upload.'
+            exit 1
+          fi
+          echo 'APK signature verified; permanent signing certificate matches.'
+
+      - name: Upload verified installable APK
+        uses: actions/upload-artifact@v4
         with:
-          name: PavDroid-V1.0.0-debug-APK
+          name: PavDroid-debug-APK
           path: app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
